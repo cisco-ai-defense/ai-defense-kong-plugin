@@ -180,6 +180,25 @@ local function reason_from_body(body, fallback)
       or fallback
 end
 
+-- AI Defense's event id (top level for chat, nested under `result` for MCP).
+-- Captured even on allow so it isn't lost when policies run in monitor mode.
+local function event_id_from_body(body)
+  if type(body) ~= "table" then
+    return nil
+  end
+  -- Only accept a non-empty string. JSON null decodes to a truthy cjson sentinel
+  -- and non-scalar values are not header-safe, so ignore them and fall through
+  -- to result.event_id rather than emitting a bad header / aborting the request.
+  if type(body.event_id) == "string" and body.event_id ~= "" then
+    return body.event_id
+  end
+  if type(body.result) == "table"
+      and type(body.result.event_id) == "string" and body.result.event_id ~= "" then
+    return body.result.event_id
+  end
+  return nil
+end
+
 -- Best-effort extraction of the triggering ruleset/category names from an AI
 -- Defense verdict. The exact response shape can vary, so several common layouts
 -- are checked. Returns a de-duplicated list (possibly empty). Used to populate
@@ -561,6 +580,7 @@ local function call_defense(conf, body, phase)
   local action = action_from_body(parsed_body)
   local reason = reason_from_body(parsed_body, "no explicit action from AI defense")
   local categories = collect_violation_categories(parsed_body)
+  local event_id = event_id_from_body(parsed_body)
 
   kong.log.info(
     "AI defense ", phase, " inspection completed",
@@ -574,12 +594,12 @@ local function call_defense(conf, body, phase)
 
   if action == "allow" then
     circuit_record_success(conf)
-    return { allowed = true, reason = reason, status = res.status, categories = categories }
+    return { allowed = true, reason = reason, status = res.status, categories = categories, event_id = event_id }
   end
 
   if action == "block" then
     circuit_record_success(conf)
-    return { allowed = false, reason = reason, status = res.status, categories = categories }
+    return { allowed = false, reason = reason, status = res.status, categories = categories, event_id = event_id }
   end
 
   -- 2xx but no usable verdict: the service is reachable but not returning a
@@ -886,7 +906,7 @@ end
 -- Standard client-facing error envelope. Detail (reason/categories) stays in
 -- logs and headers; the body is intentionally generic to avoid leaking
 -- inspection internals or detected content to the caller.
-local function error_body(code, message, decision, phase, txn)
+local function error_body(code, message, decision, phase, txn, event_id)
   return {
     error = {
       code = code,
@@ -894,6 +914,7 @@ local function error_body(code, message, decision, phase, txn)
       decision = decision,
       phase = phase,
       transaction_id = txn,
+      event_id = event_id,
     },
   }
 end
@@ -905,16 +926,17 @@ local function categories_header(categories)
   return nil
 end
 
-local function block_request(conf, categories)
+local function block_request(conf, categories, event_id)
   local txn = conf.propagate_request_id and request_id() or nil
   return kong.response.exit(conf.block_status,
     error_body("AI_DEFENSE_REQUEST_BLOCKED", "Request blocked by Cisco AI Defense Policy.",
-      "block", "request", txn),
+      "block", "request", txn, event_id),
     {
       ["x-ai-defense-decision"] = "block",
       ["x-ai-defense-phase"] = "request",
       ["x-ai-defense-categories"] = categories_header(categories),
       ["x-ai-defense-transaction-id"] = txn,
+      ["x-ai-defense-request-event-id"] = event_id,
     })
 end
 
@@ -940,9 +962,9 @@ local function fail_request_or_continue(conf, status, message, code)
   kong.service.request.set_header("x-ai-defense-request-reason", sanitize_header_value(message))
 end
 
-local function set_blocked_response(conf, code, message, decision, categories)
+local function set_blocked_response(conf, code, message, decision, categories, event_id)
   local txn = conf.propagate_request_id and request_id() or nil
-  local body = cjson.encode(error_body(code, message, decision, "response", txn))
+  local body = cjson.encode(error_body(code, message, decision, "response", txn, event_id))
       or '{"error":{"code":"' .. code .. '","decision":"' .. decision .. '","phase":"response"}}'
 
   kong.response.set_status(conf.block_status)
@@ -952,6 +974,9 @@ local function set_blocked_response(conf, code, message, decision, categories)
   local cats = categories_header(categories)
   if cats then
     kong.response.set_header("x-ai-defense-categories", cats)
+  end
+  if event_id and event_id ~= "" then
+    kong.response.set_header("x-ai-defense-response-event-id", event_id)
   end
   if txn then
     kong.response.set_header("x-ai-defense-transaction-id", txn)
@@ -1062,13 +1087,16 @@ function AiDefenseGuard:access(conf)
       record_decision(conf, "request", "block")
       kong.log.warn("request blocked by AI defense: ", decision.reason,
         " categories=", categories_header(decision.categories) or "none")
-      return block_request(conf, decision.categories)
+      return block_request(conf, decision.categories, decision.event_id)
     end
 
     record_decision(conf, "request", "allow")
     kong.log.info("AI defense request validation allowed reason=", sanitize_header_value(decision.reason))
     kong.service.request.set_header("x-ai-defense-request-decision", "allow")
     kong.service.request.set_header("x-ai-defense-request-reason", sanitize_header_value(decision.reason))
+    if decision.event_id and decision.event_id ~= "" then
+      kong.response.set_header("x-ai-defense-request-event-id", decision.event_id)
+    end
   end
 
   if conf.check_response then
@@ -1123,7 +1151,7 @@ function AiDefenseGuard:response(conf)
     kong.log.warn("response blocked by AI defense: ", decision.reason,
       " categories=", categories_header(decision.categories) or "none")
     set_blocked_response(conf, "AI_DEFENSE_RESPONSE_BLOCKED", "Response blocked by Cisco AI Defense Policy.",
-      "block", decision.categories)
+      "block", decision.categories, decision.event_id)
     return
   end
 
@@ -1131,6 +1159,9 @@ function AiDefenseGuard:response(conf)
   kong.log.info("AI defense response validation allowed reason=", sanitize_header_value(decision.reason))
   kong.response.set_header("x-ai-defense-response-decision", "allow")
   kong.response.set_header("x-ai-defense-response-reason", sanitize_header_value(decision.reason))
+  if decision.event_id and decision.event_id ~= "" then
+    kong.response.set_header("x-ai-defense-response-event-id", decision.event_id)
+  end
   if conf.propagate_request_id then
     kong.response.set_header("x-ai-defense-transaction-id", request_id())
   end
