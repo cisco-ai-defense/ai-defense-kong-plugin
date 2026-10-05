@@ -633,97 +633,295 @@ local function inspection_envelope(raw_body, name, payload_field, extra_argument
   })
 end
 
--- Normalize a message "content" into a plain string. Handles:
---   * OpenAI string content
---   * Bedrock Converse / OpenAI multipart content arrays: [{ text = "..." }, ...]
--- Returns nil when no textual content can be extracted.
-local function normalize_content(content)
+local function encode_json(value)
+  local ok, encoded = pcall(cjson.encode, value)
+  return ok and encoded or nil
+end
+
+local ALLOWED_IMAGE_MEDIA_TYPES = {
+  ["image/png"] = true,
+  ["image/jpeg"] = true,
+  ["image/gif"] = true,
+  ["image/webp"] = true,
+}
+
+local function is_inline_image_url(value)
+  if type(value) ~= "string" then
+    return false
+  end
+  for media_type in pairs(ALLOWED_IMAGE_MEDIA_TYPES) do
+    if value:match("^data:" .. media_type .. ";base64,") then
+      return true
+    end
+  end
+  return false
+end
+
+local function content_parts(content)
   if type(content) == "string" then
     return content
   end
-
-  if type(content) == "table" then
-    local parts = {}
-    for _, item in ipairs(content) do
-      if type(item) == "table" and type(item.text) == "string" and item.text ~= "" then
-        table.insert(parts, item.text)
-      end
-    end
-
-    if #parts > 0 then
-      return table.concat(parts, "\n")
-    end
-
-    local ok, encoded = pcall(cjson.encode, content)
-    if ok then
-      return encoded
-    end
+  if type(content) ~= "table" then
+    return nil
   end
 
-  return nil
-end
-
-local function chat_messages_body(raw_body, default_role)
-  local decoded = cjson.decode(raw_body or "")
-  local messages = {}
-
-  -- Request shape (OpenAI chat completions and Bedrock Converse both use a
-  -- top-level messages[] array; content may be a string or a parts array).
-  if type(decoded) == "table" and type(decoded.messages) == "table" then
-    for _, message in ipairs(decoded.messages) do
-      if type(message) == "table" then
-        local content = normalize_content(message.content)
-        if type(content) == "string" and content ~= "" then
-          table.insert(messages, {
-            role = message.role or default_role or "user",
-            content = content,
-          })
-        end
+  local parts = {}
+  for _, item in ipairs(content) do
+    if type(item) == "string" then
+      if item ~= "" then
+        table.insert(parts, { type = "text", text = item })
       end
-    end
-
-    if #messages > 0 then
-      return cjson.encode({ messages = messages })
-    end
-  end
-
-  -- OpenAI response shape: choices[].message.content
-  if type(decoded) == "table" and type(decoded.choices) == "table" then
-    for _, choice in ipairs(decoded.choices) do
-      local message = type(choice) == "table" and choice.message or nil
-      local content = type(message) == "table" and normalize_content(message.content) or nil
-      if type(content) == "string" and content ~= "" then
-        table.insert(messages, {
-          role = (type(message) == "table" and message.role) or default_role or "assistant",
-          content = content,
+    elseif type(item) == "table" then
+      if type(item.text) == "string" and item.text ~= "" then
+        table.insert(parts, { type = "text", text = item.text })
+      elseif item.type == "text" and type(item.text) == "string" and item.text ~= "" then
+        table.insert(parts, { type = "text", text = item.text })
+      elseif item.type == "image_url" and type(item.image_url) == "table"
+          and is_inline_image_url(item.image_url.url) then
+        table.insert(parts, { type = "image_url", image_url = { url = item.image_url.url } })
+      elseif item.type == "image" and type(item.source) == "table"
+          and item.source.type == "base64"
+          and type(item.source.data) == "string"
+          and ALLOWED_IMAGE_MEDIA_TYPES[item.source.media_type] then
+        table.insert(parts, {
+          type = "image_url",
+          image_url = { url = "data:" .. item.source.media_type .. ";base64," .. item.source.data },
         })
       end
     end
   end
 
-  -- Bedrock Converse response shape: output.message.content[].text
-  if #messages == 0
-      and type(decoded) == "table"
-      and type(decoded.output) == "table"
-      and type(decoded.output.message) == "table" then
-    local message = decoded.output.message
-    local content = normalize_content(message.content)
-    if type(content) == "string" and content ~= "" then
-      table.insert(messages, {
-        role = message.role or default_role or "assistant",
-        content = content,
+  if #parts == 0 then
+    -- Preserve compatibility with existing provider-specific multipart bodies
+    -- that do not use one of the supported text/image shapes.
+    return encode_json(content)
+  end
+  if #parts == 1 and parts[1].type == "text" then
+    return parts[1].text
+  end
+  return parts
+end
+
+local function normalized_tool_calls(calls)
+  local out = {}
+  if type(calls) ~= "table" then
+    return out
+  end
+
+  for _, call in ipairs(calls) do
+    local fn = type(call) == "table" and call["function"] or nil
+    if type(call) == "table" and type(fn) == "table"
+        and type(fn.name) == "string" and fn.name ~= "" then
+      local arguments = fn.arguments
+      if type(arguments) ~= "string" then
+        arguments = encode_json(arguments or {}) or "{}"
+      end
+      table.insert(out, {
+        id = type(call.id) == "string" and call.id or nil,
+        type = "function",
+        ["function"] = { name = fn.name, arguments = arguments },
       })
+    end
+  end
+  return out
+end
+
+local function append_chat_message(messages, source, default_role)
+  if type(source) ~= "table" then
+    return
+  end
+
+  local role = source.role
+  if role == "developer" then
+    role = "system"
+  end
+  if role ~= "system" and role ~= "user" and role ~= "assistant"
+      and role ~= "tool" and role ~= "function" then
+    role = default_role or "user"
+  end
+  local content = source.content
+  local tool_calls = normalized_tool_calls(source.tool_calls)
+
+  if type(content) == "table" then
+    local content_blocks, anthropic_calls = {}, tool_calls
+    local function flush_text_and_calls()
+      local merged_content
+      if #content_blocks == 1 and content_blocks[1].type == "text" then
+        merged_content = content_blocks[1].text
+      elseif #content_blocks > 0 then
+        merged_content = content_blocks
+      end
+      if merged_content ~= nil or #anthropic_calls > 0 then
+        local message = { role = role, content = merged_content or "" }
+        if #anthropic_calls > 0 then
+          message.tool_calls = anthropic_calls
+        end
+        table.insert(messages, message)
+      end
+      content_blocks, anthropic_calls = {}, {}
+    end
+
+    for _, item in ipairs(content) do
+      if type(item) == "table" and item.type == "tool_result" then
+        -- Anthropic returns tool results as blocks in a user message. The
+        -- inspection contract represents each result as its own tool message.
+        flush_text_and_calls()
+        local result_content = content_parts(item.content)
+        local tool_call_id = type(item.tool_use_id) == "string" and item.tool_use_id or nil
+        if (result_content ~= nil and result_content ~= "") or (tool_call_id and tool_call_id ~= "") then
+          table.insert(messages, {
+            role = "tool",
+            tool_call_id = tool_call_id,
+            content = result_content or "",
+          })
+        end
+      elseif type(item) == "table" and item.type == "tool_use" then
+        local arguments = encode_json(item.input or {}) or "{}"
+        if type(item.name) == "string" and item.name ~= "" then
+          table.insert(anthropic_calls, {
+            id = type(item.id) == "string" and item.id or nil,
+            type = "function",
+            ["function"] = { name = item.name, arguments = arguments },
+          })
+        end
+      elseif type(item) == "table" and item.type == "thinking" then
+        -- Do not send private chain-of-thought blocks to the inspector.
+      elseif type(item) == "table" and item.type == "redacted_thinking" then
+        -- Redacted reasoning has no user-visible content to inspect.
+      else
+        local part = content_parts({ item })
+        if type(part) == "string" and part ~= "" then
+          table.insert(content_blocks, { type = "text", text = part })
+        elseif type(part) == "table" then
+          for _, normalized_part in ipairs(part) do
+            table.insert(content_blocks, normalized_part)
+          end
+        end
+      end
+    end
+    flush_text_and_calls()
+    return
+  end
+
+  local normalized_content = content_parts(content)
+  if (normalized_content ~= nil and normalized_content ~= "") or #tool_calls > 0 then
+    local message = { role = role, content = normalized_content or "" }
+    if type(source.tool_call_id) == "string" then
+      message.tool_call_id = source.tool_call_id
+    end
+    if #tool_calls > 0 then
+      message.tool_calls = tool_calls
+    end
+    table.insert(messages, message)
+  end
+end
+
+local function anthropic_system_message(messages, system)
+  local content = content_parts(system)
+  if type(content) == "string" and content ~= "" then
+    table.insert(messages, 1, { role = "system", content = content })
+  elseif type(content) == "table" then
+    local text = {}
+    for _, part in ipairs(content) do
+      if part.type == "text" and part.text ~= "" then
+        table.insert(text, part.text)
+      end
+    end
+    if #text > 0 then
+      table.insert(messages, 1, { role = "system", content = table.concat(text, "\n") })
+    end
+  end
+end
+
+local function normalized_tool_definitions(tools)
+  local out = {}
+  if type(tools) ~= "table" then
+    return out
+  end
+
+  for _, tool in ipairs(tools) do
+    if type(tool) == "table" then
+      local fn = tool["function"]
+      local parameters = tool.input_schema
+      if type(fn) == "table" then
+        parameters = fn.parameters
+      end
+      local name = tool.name or (type(fn) == "table" and fn.name)
+      if type(name) == "string" and name ~= "" then
+        local description = tool.description or (type(fn) == "table" and fn.description)
+        if type(description) ~= "string" then
+          description = ""
+        end
+        table.insert(out, {
+          type = "function",
+          ["function"] = {
+            name = name,
+            description = description,
+            parameters = type(parameters) == "string" and parameters or encode_json(parameters or {}) or "{}",
+          },
+        })
+      end
+    end
+  end
+  return out
+end
+
+local function chat_messages_body(raw_body, default_role)
+  local decoded = cjson.decode(raw_body or "")
+  local messages, tools = {}, {}
+  local recognized_chat_shape = false
+
+  if type(decoded) == "table" then
+    if decoded.system ~= nil then
+      anthropic_system_message(messages, decoded.system)
+    end
+
+    if type(decoded.messages) == "table" then
+      recognized_chat_shape = true
+      for _, message in ipairs(decoded.messages) do
+        append_chat_message(messages, message, default_role or "user")
+      end
+      tools = normalized_tool_definitions(decoded.tools)
+    end
+
+    -- OpenAI response shape: choices[].message.content
+    if #messages == 0 and type(decoded.choices) == "table" then
+      recognized_chat_shape = true
+      for _, choice in ipairs(decoded.choices) do
+        local message = type(choice) == "table" and choice.message or nil
+        append_chat_message(messages, message, "assistant")
+      end
+    end
+
+    -- Anthropic Messages API response shape.
+    if #messages == 0 and decoded.type == "message" and decoded.role == "assistant" then
+      recognized_chat_shape = true
+      append_chat_message(messages, decoded, "assistant")
+    end
+
+    -- Bedrock Converse response shape: output.message.content[].text
+    if #messages == 0 and type(decoded.output) == "table"
+        and type(decoded.output.message) == "table" then
+      recognized_chat_shape = true
+      local message = decoded.output.message
+      append_chat_message(messages, message, "assistant")
     end
   end
 
   if #messages == 0 then
-    table.insert(messages, {
-      role = default_role or "assistant",
-      content = raw_body or "",
-    })
+    -- Avoid forwarding an empty provider turn or re-embedding Anthropic
+    -- thinking-only JSON as prompt text. ChatInspectRequest requires a message,
+    -- so use an explicit empty-analysis marker when the recognized payload had
+    -- no supported user-visible content or tool calls.
+    local content = recognized_chat_shape and "[No inspectable chat content]" or (raw_body or "")
+    table.insert(messages, { role = default_role or "assistant", content = content })
   end
 
-  return cjson.encode({ messages = messages })
+  local inspection_request = { messages = messages }
+  if #tools > 0 then
+    inspection_request.tools = tools
+  end
+  return cjson.encode(inspection_request)
 end
 
 local function looks_like_json(value)
