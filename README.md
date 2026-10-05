@@ -53,14 +53,16 @@ An explicit `request_payload_mode` / `response_payload_mode` always overrides th
 
 | Profile | Use case | Request payload | Response payload |
 | --- | --- | --- | --- |
-| `model` | OpenAI-compatible chat / Bedrock Converse | `chat_messages` | `chat_messages` |
+| `model` | OpenAI-compatible chat / Anthropic Messages / Bedrock Converse | `chat_messages` | `chat_messages` |
 | `mcp` | Model Context Protocol (JSON-RPC) | `raw_body` | `mcp_jsonrpc` |
 | `custom` (default) | Anything else | `raw_body` | `inspection_envelope` |
 
 Payload modes:
 
-- **`chat_messages`** — extracts `{ "messages": [{ "role", "content" }] }` from OpenAI chat
-  completions and Bedrock Converse (request and response shapes), normalizing multipart content.
+- **`chat_messages`** — converts OpenAI chat completions, Anthropic Messages, and Bedrock Converse
+  request/response shapes into the AI Defense chat-inspection contract. Anthropic system prompts
+  become `system` messages; `tool_use` / `tool_result` blocks become assistant tool calls / tool
+  messages; tool definitions and supported inline images are normalized as well.
 - **`mcp_jsonrpc`** — sends the MCP JSON-RPC message. For **responses**, the plugin merges the
   originating request's `method` and `params` with the response `result`/`error`
   (`{ jsonrpc, id, method, params, result }`), because the AI Defense MCP inspector requires
