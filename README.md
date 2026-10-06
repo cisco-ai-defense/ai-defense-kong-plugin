@@ -111,7 +111,7 @@ the fail-open / fail-closed path.
 | `request_payload_mode` | No | (profile) | `raw_body` \| `inspection_envelope` \| `chat_messages`. |
 | `response_payload_mode` | No | (profile) | `raw_body` \| `inspection_envelope` \| `chat_messages` \| `mcp_jsonrpc`. |
 | `ssl_verify` | No | `true` | Verify the AI Defense TLS certificate. |
-| `max_body_bytes` | No | `0` | Max payload sent to AI Defense (0 = unlimited). |
+| `max_body_bytes` | No | `10485760` (10 MiB) | Maximum request/response bytes inspected. For requests, bounds file-backed body reads; `0` disables the plugin limit. |
 | `max_retries` | No | `1` | Extra retries on transport callout failure, 0–5. |
 | `keepalive_pool` | No | `10` | Keepalive connection pool size to AI Defense. |
 | `circuit_breaker` | No | `true` | Enable the circuit breaker. |
@@ -160,8 +160,10 @@ Response headers on every plugin-generated response:
 | `x-ai-defense-categories` | Comma-separated triggering rulesets (e.g. `PII,Prompt Injection`), when available |
 | `x-ai-defense-transaction-id` | Correlation id; matches the AI Defense / orchestrator logs |
 
-The HTTP status is the configurable `block_status` (default `400`); use `decision` / `code` — not
-status — to distinguish a policy block from an inspection failure.
+AI Defense policy blocks and fail-closed response inspection errors use the configurable
+`block_status` (default `400`). Request payload-size errors use `413`; other fail-closed request
+inspection errors use `502`. Use `decision` / `code` — not status alone — to distinguish a policy
+block from an inspection failure.
 
 ## Install
 
@@ -172,8 +174,10 @@ immutable). Use the **volume mount** for local development.
 ### Prerequisites
 
 - Kong Gateway 3.4 or later (this repo builds on `kong/kong-gateway:3.14`).
+- Kong 3.9.2 and later can read file-backed request bodies through the PDK; older supported versions use a bounded read of Nginx's cached body file.
 - A Cisco AI Defense inspection endpoint (`https://`) and API key.
 - Network egress from Kong to the AI Defense endpoint.
+- If you configure an Nginx `client_max_body_size` cap, keep it at least as high as the plugin's `max_body_bytes` limit.
 - An `lua_shared_dict` named `ai_defense` for cross-worker circuit-breaker / metrics state
   (`KONG_NGINX_HTTP_LUA_SHARED_DICT="ai_defense 16m"`).
 
@@ -229,6 +233,7 @@ RUN chown -R kong:kong /usr/local/share/lua/5.1/kong/plugins/ai-defense-intercep
 USER kong
 ENV KONG_PLUGINS=bundled,ai-defense-intercept
 ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="ai_defense 16m"
+ENV KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE=100m
 ```
 
 ```bash
