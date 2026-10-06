@@ -127,13 +127,14 @@ return {
             },
           },
           {
-            -- Maximum payload size (bytes) that will be sent to AI Defense.
-            -- 0 disables the limit. When exceeded, the configured
-            -- fail_closed behavior applies (block) or the request/response
-            -- is allowed through uninspected (fail open).
+            -- Maximum payload size (bytes) read for inspection and sent to AI
+            -- Defense. The finite default bounds per-request Lua memory use.
+            -- 0 explicitly disables the plugin limit. When exceeded, the
+            -- configured fail_closed behavior applies (block) or the
+            -- request/response is allowed through uninspected (fail open).
             max_body_bytes = {
               type = "integer",
-              default = 0,
+              default = 10485760,
               between = { 0, 104857600 },
             },
           },

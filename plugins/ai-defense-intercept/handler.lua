@@ -92,10 +92,62 @@ local function profile_value(conf, model_value, mcp_value, custom_value)
   return custom_value
 end
 
-local function get_request_body()
-  local ok, body, err = pcall(kong.request.get_raw_body)
+local function read_request_body_file(max_allowed_file_size)
+  local ok, body_file = pcall(ngx.req.get_body_file)
+  if not ok then
+    return nil, "failed to locate cached request body: " .. tostring(body_file)
+  end
+  if not body_file then
+    return nil, "request body was not available in memory or a temporary file"
+  end
+
+  local file, err = io.open(body_file, "rb")
+  if not file then
+    return nil, "failed to open cached request body: " .. tostring(err)
+  end
+
+  local size = file:seek("end")
+  if not size then
+    file:close()
+    return nil, "failed to determine cached request body size"
+  end
+  if max_allowed_file_size > 0 and size > max_allowed_file_size then
+    file:close()
+    return nil, ("request body file too big: %d > %d"):format(size, max_allowed_file_size)
+  end
+
+  local position, seek_err = file:seek("set")
+  if not position then
+    file:close()
+    return nil, "failed to rewind cached request body: " .. tostring(seek_err)
+  end
+
+  local body, read_err = file:read("*a")
+  file:close()
+  if not body then
+    return nil, "failed to read cached request body: " .. tostring(read_err)
+  end
+
+  return body
+end
+
+local function get_request_body(conf)
+  -- Kong normally reads the request body only from Nginx's in-memory client
+  -- body buffer. Larger bodies spill to a temporary file, so pass the plugin's
+  -- configured limit to let the PDK read that file as well. A limit of 0 is
+  -- unlimited; the schema uses a finite default to bound Lua memory use.
+  local max_allowed_file_size = conf.max_body_bytes or 0
+  local ok, body, err = pcall(kong.request.get_raw_body, max_allowed_file_size)
   if not ok then
     return nil, body
+  end
+
+  -- Kong added native file-backed reads in 3.9.2. On older supported versions,
+  -- get_raw_body() returns this buffer error; read Nginx's cached body file
+  -- directly, enforcing the same configured size limit before allocating it.
+  if not body and err
+      and tostring(err):match("request body did not fit into client body buffer") then
+    return read_request_body_file(max_allowed_file_size)
   end
 
   return body or "", err
@@ -947,9 +999,13 @@ local function fail_request_or_continue(conf, status, message, code)
   if conf.fail_closed then
     record_fail_mode(conf, "request", "closed")
     local txn = conf.propagate_request_id and request_id() or nil
+    local public_message = "Cisco AI Defense request inspection unavailable."
+    if code == "AI_DEFENSE_PAYLOAD_TOO_LARGE" then
+      public_message = "Request body exceeds the configured inspection size limit."
+    end
     return kong.response.exit(status,
       error_body(code or "AI_DEFENSE_REQUEST_UNAVAILABLE",
-        "Cisco AI Defense request inspection unavailable.", "error", "request", txn),
+        public_message, "error", "request", txn),
       {
         ["x-ai-defense-decision"] = "error",
         ["x-ai-defense-phase"] = "request",
@@ -996,8 +1052,12 @@ local function fail_response_or_continue(conf, message, code)
 
   if conf.fail_closed then
     record_fail_mode(conf, "response", "closed")
+    local public_message = "Cisco AI Defense response inspection unavailable."
+    if code == "AI_DEFENSE_PAYLOAD_TOO_LARGE" then
+      public_message = "Response body exceeds the configured inspection size limit."
+    end
     set_blocked_response(conf, code or "AI_DEFENSE_RESPONSE_UNAVAILABLE",
-      "Cisco AI Defense response inspection unavailable.", "error", nil)
+      public_message, "error", nil)
     return
   end
 
@@ -1031,7 +1091,7 @@ function AiDefenseGuard:access(conf)
   -- context capture needs it.
   local request_body, body_err
   if conf.check_request or conf.mcp_bypass_control_methods or need_mcp_request_ctx then
-    request_body, body_err = get_request_body()
+    request_body, body_err = get_request_body(conf)
   end
 
   -- MCP control-message bypass: handshakes (initialize, tools/list, ping, ...)
@@ -1057,7 +1117,17 @@ function AiDefenseGuard:access(conf)
   if conf.check_request then
     local body, err = request_body, body_err
     if err then
-      return fail_request_or_continue(conf, 413, "request body could not be read: " .. tostring(err),
+      -- Kong reports a file-backed body over max_allowed_file_size with this
+      -- specific error. Classify it like an oversized in-memory body instead
+      -- of reporting a generic body-read failure.
+      if (conf.max_body_bytes or 0) > 0
+          and tostring(err):match("^request body file too big:") then
+        return fail_request_or_continue(conf, 413,
+          "request body exceeds max_body_bytes (" .. conf.max_body_bytes .. ")",
+          "AI_DEFENSE_PAYLOAD_TOO_LARGE")
+      end
+
+      return fail_request_or_continue(conf, 502, "request body could not be read: " .. tostring(err),
         "AI_DEFENSE_REQUEST_UNAVAILABLE")
     end
 
