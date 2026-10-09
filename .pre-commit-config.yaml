@@ -6,11 +6,11 @@ repos:
       - id: end-of-file-fixer
       - id: trailing-whitespace
   - repo: https://github.com/google/addlicense
-    rev: 499ed7f28389eb4a08c2d7e40b1637cfd7f65381
+    rev: 4529cd558fa0bf07ab0f2650e36d089fb1c07c89
     hooks:
       - id: addlicense
         args: [ "-v", "-s",
                 "-c", "Cisco Systems, Inc. and its affiliates",
                 "-l", "apache",
                 "plugins" ]
-        types: [ python ]
+        types: [ lua ]
