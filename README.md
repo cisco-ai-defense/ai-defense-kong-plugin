@@ -237,8 +237,8 @@ ENV KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE=100m
 ```
 
 ```bash
-docker build -f docker/Dockerfile -t <registry>/ai-defense-kong-gateway:<tag> .
-docker push <registry>/ai-defense-kong-gateway:<tag>
+docker build -f docker/Dockerfile -t <registry>/ai-defense-kong-plugin:<tag> .
+docker push <registry>/ai-defense-kong-plugin:<tag>
 ```
 
 This repository's [`docker/Dockerfile`](../docker/Dockerfile) additionally bakes the declarative
@@ -251,7 +251,7 @@ config as a template and renders secrets at startup — see the [README](../READ
 ```yaml
 containers:
   - name: kong-gateway
-    image: <registry>/ai-defense-kong-gateway:<tag>
+    image: <registry>/ai-defense-kong-plugin:<tag>
     env:
       - name: KONG_PLUGINS
         value: "bundled,ai-defense-intercept"
@@ -389,7 +389,7 @@ Logs (the plugin logs verdicts, categories, and the AI Defense response body on 
 # Docker
 docker logs <kong-container> 2>&1 | grep -i "ai-defense-intercept"
 # Kubernetes
-kubectl logs -f deploy/ai-defense-kong-gateway | grep -i "ai-defense-intercept"
+kubectl logs -f deploy/ai-defense-kong-plugin | grep -i "ai-defense-intercept"
 ```
 
 Correlate a client-visible `transaction_id` with the AI Defense / orchestrator logs to see the full
