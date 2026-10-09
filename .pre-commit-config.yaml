@@ -12,5 +12,5 @@ repos:
         args: [ "-v", "-s",
                 "-c", "Cisco Systems, Inc. and its affiliates",
                 "-l", "apache",
-                "aidefense", "examples" ]
+                "plugins" ]
         types: [ python ]
