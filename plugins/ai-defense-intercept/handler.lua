@@ -1,19 +1,3 @@
--- Copyright 2026 Cisco Systems, Inc. and its affiliates
---
--- Licensed under the Apache License, Version 2.0 (the "License");
--- you may not use this file except in compliance with the License.
--- You may obtain a copy of the License at
---
---     http://www.apache.org/licenses/LICENSE-2.0
---
--- Unless required by applicable law or agreed to in writing, software
--- distributed under the License is distributed on an "AS IS" BASIS,
--- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
--- See the License for the specific language governing permissions and
--- limitations under the License.
---
--- SPDX-License-Identifier: Apache-2.0
-
 local cjson = require "cjson.safe"
 local http = require "resty.http"
 
@@ -994,11 +978,68 @@ local function categories_header(categories)
   return nil
 end
 
+-- Map an HTTP status to an Anthropic Messages API error `type`. Used only when
+-- client_error_format = "anthropic". Falls back to invalid_request_error so an
+-- unmapped status still yields a schema-valid error object.
+local ANTHROPIC_ERROR_TYPE = {
+  [400] = "invalid_request_error",
+  [401] = "authentication_error",
+  [403] = "permission_error",
+  [404] = "not_found_error",
+  [413] = "request_too_large",
+  [429] = "rate_limit_error",
+  [500] = "api_error",
+  [502] = "api_error",
+  [529] = "overloaded_error",
+}
+
+-- Render the client-facing error body in the shape the caller's SDK expects.
+-- "generic" (default) preserves the original envelope exactly, so existing
+-- consumers (Bedrock, MCP, custom) are unaffected. "anthropic"/"openai" emit a
+-- schema-valid error object so strict clients (e.g. Claude Code on the native
+-- Anthropic API) can parse the block/fail response instead of treating it as a
+-- malformed reply. Only the body shape changes; status and headers are set by
+-- the callers and are unaffected.
+local function client_error_payload(conf, status, code, message, decision, phase, txn, event_id, categories)
+  local fmt = conf.client_error_format or "generic"
+
+  if fmt == "anthropic" then
+    local detail = message
+    local cats = categories_header(categories)
+    if cats then
+      detail = detail .. " [" .. cats .. "]"
+    end
+    if event_id and event_id ~= "" then
+      detail = detail .. " (event_id=" .. event_id .. ")"
+    end
+    return {
+      type = "error",
+      error = {
+        type = ANTHROPIC_ERROR_TYPE[status] or "invalid_request_error",
+        message = detail,
+      },
+    }
+  end
+
+  if fmt == "openai" then
+    return {
+      error = {
+        message = message,
+        type = "invalid_request_error",
+        code = code,
+      },
+    }
+  end
+
+  -- Default: unchanged generic envelope.
+  return error_body(code, message, decision, phase, txn, event_id)
+end
+
 local function block_request(conf, categories, event_id)
   local txn = conf.propagate_request_id and request_id() or nil
   return kong.response.exit(conf.block_status,
-    error_body("AI_DEFENSE_REQUEST_BLOCKED", "Request blocked by Cisco AI Defense Policy.",
-      "block", "request", txn, event_id),
+    client_error_payload(conf, conf.block_status, "AI_DEFENSE_REQUEST_BLOCKED",
+      "Request blocked by Cisco AI Defense Policy.", "block", "request", txn, event_id, categories),
     {
       ["x-ai-defense-decision"] = "block",
       ["x-ai-defense-phase"] = "request",
@@ -1020,8 +1061,8 @@ local function fail_request_or_continue(conf, status, message, code)
       public_message = "Request body exceeds the configured inspection size limit."
     end
     return kong.response.exit(status,
-      error_body(code or "AI_DEFENSE_REQUEST_UNAVAILABLE",
-        public_message, "error", "request", txn),
+      client_error_payload(conf, status, code or "AI_DEFENSE_REQUEST_UNAVAILABLE",
+        public_message, "error", "request", txn, nil, nil),
       {
         ["x-ai-defense-decision"] = "error",
         ["x-ai-defense-phase"] = "request",
@@ -1036,7 +1077,8 @@ end
 
 local function set_blocked_response(conf, code, message, decision, categories, event_id)
   local txn = conf.propagate_request_id and request_id() or nil
-  local body = cjson.encode(error_body(code, message, decision, "response", txn, event_id))
+  local body = cjson.encode(client_error_payload(conf, conf.block_status, code, message,
+      decision, "response", txn, event_id, categories))
       or '{"error":{"code":"' .. code .. '","decision":"' .. decision .. '","phase":"response"}}'
 
   kong.response.set_status(conf.block_status)
