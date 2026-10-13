@@ -89,6 +89,18 @@ return {
             },
           },
           {
+            -- Shape of the client-facing error body on block / fail-closed.
+            --   generic   -> {"error":{code,message,decision,phase,...}} (default; unchanged)
+            --   anthropic -> {"type":"error","error":{"type","message"}} (Anthropic Messages API)
+            --   openai    -> {"error":{message,type,code}} (OpenAI-compatible)
+            -- Only the body shape changes; block_status and headers are unaffected.
+            client_error_format = {
+              type = "string",
+              default = "generic",
+              one_of = { "generic", "anthropic", "openai" },
+            },
+          },
+          {
             check_request = {
               type = "boolean",
               default = true,
