@@ -125,6 +125,29 @@ return {
             },
           },
           {
+            -- chat_messages request inspection only. "all" sends every message
+            -- in the conversation; "latest_turn" sends only the messages after
+            -- the last assistant message. Agent clients such as Claude Code
+            -- resend the whole conversation on every turn, which soon outgrows
+            -- what the inspect API accepts (it times out rather than answering),
+            -- and every earlier turn was already inspected when first sent.
+            chat_messages_scope = {
+              type = "string",
+              default = "all",
+              one_of = { "all", "latest_turn" },
+            },
+          },
+          {
+            -- chat_messages only. Longest content, in bytes, sent for any one
+            -- message or tool-call argument; longer text keeps its start and
+            -- end around a truncation marker. 0 disables the limit.
+            max_message_bytes = {
+              type = "integer",
+              default = 0,
+              between = { 0, 104857600 },
+            },
+          },
+          {
             request_inspection_name = {
               type = "string",
               default = "kong_request_inspection",

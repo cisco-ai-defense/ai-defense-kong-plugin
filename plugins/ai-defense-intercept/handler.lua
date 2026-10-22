@@ -701,9 +701,26 @@ local function inspection_envelope(raw_body, name, payload_field, extra_argument
   })
 end
 
+-- Append the text of an Anthropic tool_result block. Its content is either a
+-- string or an array of { type = "text", text = ... } parts.
+local function append_tool_result(parts, item)
+  local inner = item.content
+  if type(inner) == "string" and inner ~= "" then
+    table.insert(parts, inner)
+  elseif type(inner) == "table" then
+    for _, sub in ipairs(inner) do
+      if type(sub) == "table" and type(sub.text) == "string" and sub.text ~= "" then
+        table.insert(parts, sub.text)
+      end
+    end
+  end
+end
+
 -- Normalize a message "content" into a plain string. Handles:
 --   * OpenAI string content
---   * Bedrock Converse / OpenAI multipart content arrays: [{ text = "..." }, ...]
+--   * Bedrock Converse / OpenAI / Anthropic multipart arrays: [{ text = "..." }, ...]
+--   * Anthropic tool_result parts, whose text is nested one level down. This is
+--     where tool output lands, file contents included, so it must be inspected.
 -- Returns nil when no textual content can be extracted.
 local function normalize_content(content)
   if type(content) == "string" then
@@ -715,6 +732,8 @@ local function normalize_content(content)
     for _, item in ipairs(content) do
       if type(item) == "table" and type(item.text) == "string" and item.text ~= "" then
         table.insert(parts, item.text)
+      elseif type(item) == "table" and item.type == "tool_result" then
+        append_tool_result(parts, item)
       end
     end
 
@@ -731,17 +750,263 @@ local function normalize_content(content)
   return nil
 end
 
-local function chat_messages_body(raw_body, default_role)
+-- A UTF-8 continuation byte (10xxxxxx) never starts a character, so a cut
+-- placed on one would split a character and send AI Defense invalid UTF-8.
+local function is_continuation(text, pos)
+  local b = text:byte(pos)
+  return b ~= nil and b >= 0x80 and b < 0xC0
+end
+
+-- Keep the start and end of text within max_bytes. Both ends are kept because
+-- an injection can sit at either: a pasted document's first line, or a
+-- request appended after a long tool output.
+local TRUNCATION_MARKER = "\n[... truncated for inspection ...]\n"
+
+local function clip(text, max_bytes)
+  if type(text) ~= "string" or not max_bytes or max_bytes <= 0 or #text <= max_bytes then
+    return text
+  end
+
+  local keep = max_bytes - #TRUNCATION_MARKER
+  if keep < 2 then
+    keep = max_bytes
+  end
+
+  local head_end = math.floor(keep / 2)
+  while head_end > 0 and is_continuation(text, head_end + 1) do
+    head_end = head_end - 1
+  end
+
+  local tail_start = #text - (keep - head_end) + 1
+  while tail_start <= #text and is_continuation(text, tail_start) do
+    tail_start = tail_start + 1
+  end
+
+  return text:sub(1, head_end) .. TRUNCATION_MARKER .. text:sub(tail_start)
+end
+
+-- Structured request content for AI Defense. Returns a plain string for string
+-- content, or a typed parts array [{type="text",text=...}] for a multipart
+-- message, so each text block stays a discrete content part instead of being
+-- flattened into one string (a later injection is then not diluted by an
+-- earlier benign part, e.g. Claude Code's system-reminder). The set of text
+-- inspected is identical to normalize_content (message text + tool_result
+-- text), clipped per part. Falls back to normalize_content's behaviour (encoded
+-- content) when there is no discrete text, so coverage is unchanged.
+local function structured_content(content, max_bytes)
+  if type(content) == "string" then
+    if content == "" then
+      return nil
+    end
+    return clip(content, max_bytes)
+  end
+
+  if type(content) ~= "table" then
+    return nil
+  end
+
+  -- Collect the inspected text blocks in order (message text + tool_result
+  -- text) - the same set normalize_content would gather.
+  local texts = {}
+  for _, item in ipairs(content) do
+    if type(item) == "table" then
+      if type(item.text) == "string" and item.text ~= "" then
+        texts[#texts + 1] = item.text
+      elseif item.type == "tool_result" then
+        local tr = {}
+        append_tool_result(tr, item)
+        for _, txt in ipairs(tr) do
+          if txt ~= "" then
+            texts[#texts + 1] = txt
+          end
+        end
+      end
+    end
+  end
+
+  if #texts == 0 then
+    -- No discrete text (e.g. a tool_use-only message): preserve
+    -- normalize_content's fallback so inspection coverage does not change.
+    local normalized = normalize_content(content)
+    if type(normalized) == "string" and normalized ~= "" then
+      return clip(normalized, max_bytes)
+    end
+    return nil
+  end
+
+  -- The byte budget is per MESSAGE, shared across all its parts - NOT per part.
+  -- Applying the limit to each block independently would let N blocks produce
+  -- up to N * max_bytes (e.g. two parallel tool_result values ~ 40 KB under a
+  -- 20 KB limit), defeating the limit the Anthropic route sets to avoid
+  -- oversized inspect/chat calls (which, with fail_closed:false, would forward
+  -- uninspected). Account for the "\n" joins used when the parts are combined.
+  local total = 0
+  for i, t in ipairs(texts) do
+    total = total + #t
+    if i > 1 then
+      total = total + 1
+    end
+  end
+
+  if max_bytes and max_bytes > 0 and total > max_bytes then
+    -- Over the shared budget: truncate the COMBINED message head+tail (so an
+    -- injection at either end survives) and send it as one structured text
+    -- part. Discreteness is dropped only when the message would otherwise blow
+    -- the inspect limit.
+    return { { type = "text", text = clip(table.concat(texts, "\n"), max_bytes) } }
+  end
+
+  -- Within budget: keep each block as a discrete part so a later injection is
+  -- not diluted by an earlier benign part.
+  local parts = {}
+  for _, t in ipairs(texts) do
+    parts[#parts + 1] = { type = "text", text = t }
+  end
+  return parts
+end
+
+-- Tool calls go to AI Defense as OpenAI-style tool_calls, not as text. The
+-- difference is not cosmetic: the same "rm -rf /" command is flagged as Tool
+-- Exploitation in tool_calls and allowed when it appears as plain assistant
+-- text. String input values are clipped individually so the arguments stay
+-- valid JSON.
+local function tool_call(id, name, input, max_bytes)
+  local args
+  if type(input) == "table" then
+    local clipped = {}
+    for k, v in pairs(input) do
+      clipped[k] = clip(v, max_bytes)
+    end
+    args = cjson.encode(clipped) or "{}"
+  else
+    args = clip(tostring(input or ""), max_bytes)
+  end
+
+  return {
+    id = id or "call",
+    type = "function",
+    ["function"] = { name = name or "tool", arguments = args },
+  }
+end
+
+-- The assistant message AI Defense should see for an Anthropic reply: text
+-- blocks as content, tool_use blocks as tool_calls. Thinking blocks are left
+-- out; they are not output the user or a tool acts on.
+local function anthropic_assistant_message(content, max_bytes)
+  local texts, calls = {}, {}
+  for _, block in ipairs(content) do
+    if type(block) == "table" then
+      if block.type == "text" and type(block.text) == "string" and block.text ~= "" then
+        table.insert(texts, block.text)
+      elseif block.type == "tool_use" then
+        table.insert(calls, tool_call(block.id, block.name, block.input, max_bytes))
+      end
+    end
+  end
+
+  if #texts == 0 and #calls == 0 then
+    return nil
+  end
+
+  local message = { role = "assistant", content = clip(table.concat(texts, "\n"), max_bytes) }
+  if #calls > 0 then
+    message.tool_calls = calls
+  end
+  return message
+end
+
+-- Reassemble a streamed Anthropic reply (text/event-stream) into the same
+-- content blocks a non-streaming reply carries. Blocks arrive one at a time,
+-- keyed by index: text as text_delta fragments, tool input as partial JSON
+-- that is only parseable once the block is complete.
+local function anthropic_sse_content(raw_body)
+  if type(raw_body) ~= "string" or not raw_body:find("message_start", 1, true) then
+    return nil
+  end
+
+  local blocks, order = {}, {}
+  for line in raw_body:gmatch("[^\r\n]+") do
+    local data = line:match("^data:%s*(.+)$")
+    local event = data and cjson.decode(data)
+    if type(event) == "table" and event.index ~= nil then
+      local idx = event.index
+      if event.type == "content_block_start" and type(event.content_block) == "table" then
+        local cb = event.content_block
+        blocks[idx] = { type = cb.type, id = cb.id, name = cb.name, text = { cb.text or "" }, json = {} }
+        table.insert(order, idx)
+      elseif event.type == "content_block_delta" and blocks[idx] and type(event.delta) == "table" then
+        local delta = event.delta
+        if delta.type == "text_delta" and type(delta.text) == "string" then
+          table.insert(blocks[idx].text, delta.text)
+        elseif delta.type == "input_json_delta" and type(delta.partial_json) == "string" then
+          table.insert(blocks[idx].json, delta.partial_json)
+        end
+      end
+    end
+  end
+
+  local content = {}
+  for _, idx in ipairs(order) do
+    local b = blocks[idx]
+    if b.type == "text" then
+      table.insert(content, { type = "text", text = table.concat(b.text) })
+    elseif b.type == "tool_use" then
+      local raw_input = table.concat(b.json)
+      local input = raw_input ~= "" and cjson.decode(raw_input) or {}
+      table.insert(content, { type = "tool_use", id = b.id, name = b.name, input = input or raw_input })
+    end
+  end
+  return content
+end
+
+-- Index of the first message in the latest turn: everything after the last
+-- assistant message. If the conversation ends on an assistant message (a
+-- prefill), that message alone is the turn.
+local function latest_turn_start(messages)
+  for i = #messages, 1, -1 do
+    local m = messages[i]
+    if type(m) == "table" and m.role == "assistant" then
+      return i < #messages and i + 1 or i
+    end
+  end
+  return 1
+end
+
+local function chat_messages_body(raw_body, default_role, opts)
+  opts = opts or {}
+  local max_bytes = opts.max_message_bytes or 0
   local decoded = cjson.decode(raw_body or "")
   local messages = {}
 
-  -- Request shape (OpenAI chat completions and Bedrock Converse both use a
-  -- top-level messages[] array; content may be a string or a parts array).
+  -- Streamed Anthropic reply: not JSON, so it is recognised before decoding
+  -- matters. Without this the whole event stream would be inspected as one
+  -- blob of JSON fragments, with the text split across token-sized deltas.
+  if decoded == nil then
+    local content = anthropic_sse_content(raw_body)
+    local message = content and anthropic_assistant_message(content, max_bytes)
+    if message then
+      return cjson.encode({ messages = { message } })
+    end
+  end
+
+  -- Request shape (OpenAI chat completions, Bedrock Converse and the Anthropic
+  -- Messages API all use a top-level messages[] array; content may be a string
+  -- or a parts array).
   if type(decoded) == "table" and type(decoded.messages) == "table" then
-    for _, message in ipairs(decoded.messages) do
+    local first = 1
+    if opts.scope == "latest_turn" then
+      first = latest_turn_start(decoded.messages)
+    end
+
+    for i = first, #decoded.messages do
+      local message = decoded.messages[i]
       if type(message) == "table" then
-        local content = normalize_content(message.content)
-        if type(content) == "string" and content ~= "" then
+        -- Preserve each text block as a discrete content part (vs flattening to
+        -- one string), so an injection in a later part is not diluted by an
+        -- earlier benign part. Same inspected text set as before, clipped per
+        -- part; plain-string content and the no-text fallback are unchanged.
+        local content = structured_content(message.content, max_bytes)
+        if content ~= nil then
           table.insert(messages, {
             role = message.role or default_role or "user",
             content = content,
@@ -751,7 +1016,28 @@ local function chat_messages_body(raw_body, default_role)
     end
 
     if #messages > 0 then
-      return cjson.encode({ messages = messages })
+      -- System messages go first, other order preserved. AI Defense returns
+      -- is_safe=true for a conversation that ENDS on a system message, even
+      -- when the user message before it is a plain prompt injection, so a
+      -- client could otherwise evade inspection by appending one. Claude Code
+      -- does exactly that on every request, with its environment context.
+      local ordered = {}
+      for _, m in ipairs(messages) do
+        if m.role == "system" then table.insert(ordered, m) end
+      end
+      for _, m in ipairs(messages) do
+        if m.role ~= "system" then table.insert(ordered, m) end
+      end
+      return cjson.encode({ messages = ordered })
+    end
+  end
+
+  -- Anthropic Messages response shape: top-level content[] of text and
+  -- tool_use blocks.
+  if type(decoded) == "table" and decoded.type == "message" and type(decoded.content) == "table" then
+    local message = anthropic_assistant_message(decoded.content, max_bytes)
+    if message then
+      return cjson.encode({ messages = { message } })
     end
   end
 
@@ -763,7 +1049,7 @@ local function chat_messages_body(raw_body, default_role)
       if type(content) == "string" and content ~= "" then
         table.insert(messages, {
           role = (type(message) == "table" and message.role) or default_role or "assistant",
-          content = content,
+          content = clip(content, max_bytes),
         })
       end
     end
@@ -779,7 +1065,7 @@ local function chat_messages_body(raw_body, default_role)
     if type(content) == "string" and content ~= "" then
       table.insert(messages, {
         role = message.role or default_role or "assistant",
-        content = content,
+        content = clip(content, max_bytes),
       })
     end
   end
@@ -787,7 +1073,7 @@ local function chat_messages_body(raw_body, default_role)
   if #messages == 0 then
     table.insert(messages, {
       role = default_role or "assistant",
-      content = raw_body or "",
+      content = clip(raw_body or "", max_bytes),
     })
   end
 
@@ -931,7 +1217,10 @@ end
 local function request_inspection_body(conf, raw_body)
   local payload_mode = resolve_payload_mode(conf, "request")
   if payload_mode == "chat_messages" then
-    return chat_messages_body(raw_body, "user")
+    return chat_messages_body(raw_body, "user", {
+      scope = conf.chat_messages_scope,
+      max_message_bytes = conf.max_message_bytes,
+    })
   end
 
   if payload_mode == "raw_body" then
@@ -951,7 +1240,9 @@ end
 local function response_inspection_body(conf, raw_body)
   local payload_mode = resolve_payload_mode(conf, "response")
   if payload_mode == "chat_messages" then
-    return chat_messages_body(raw_body, "assistant")
+    return chat_messages_body(raw_body, "assistant", {
+      max_message_bytes = conf.max_message_bytes,
+    })
   end
 
   if payload_mode == "mcp_jsonrpc" then
@@ -1245,6 +1536,11 @@ function AiDefenseGuard:access(conf)
 
   if conf.check_response then
     kong.service.request.enable_buffering()
+    -- The buffered body is inspected as-is, and nothing here decompresses it.
+    -- Clients such as Claude Code ask for gzip, and a compressed reply would
+    -- reach AI Defense as binary, find no violation, and be allowed: a silent
+    -- pass rather than an error. So ask the upstream for an uncompressed one.
+    kong.service.request.set_header("accept-encoding", "identity")
   end
 end
 
