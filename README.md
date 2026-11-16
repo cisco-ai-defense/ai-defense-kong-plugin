@@ -330,6 +330,39 @@ plugins:
       check_response: true
 ```
 
+### Echo client headers back on the response (companion recipe)
+
+The plugin surfaces its own correlation id (`x-ai-defense-transaction-id`). If you also
+want selected **client request headers reflected back on the response** — for example a
+session id or a correlation id that an agent client sends on every request — that is a
+Kong concern, not a plugin feature. A stock `post-function` on the same route echoes any
+headers you list, unchanged. Add the header names you want reflected to `echo_headers`:
+
+```yaml
+plugins:
+  - name: post-function
+    config:
+      header_filter:
+        - |
+          local echo_headers = {
+            "x-session-id",
+            "x-request-id",
+            "x-correlation-id",
+          }
+          for _, name in ipairs(echo_headers) do
+            local value = kong.request.get_header(name)
+            if value then kong.response.set_header(name, value) end
+          end
+```
+
+Notes:
+
+- Use the `header_filter` phase (not `access`) so `kong.response.set_header` lands on the
+  proxied upstream response; the request headers are still readable there.
+- Requires `KONG_UNTRUSTED_LUA=on` (the serverless `post-function` plugin must be enabled).
+- Headers are echoed **as-is**. List only headers that are safe to reflect — do not echo
+  credential / authorization headers back to the client.
+
 ### Admin API (DB-backed Kong Gateway)
 
 ```sh
